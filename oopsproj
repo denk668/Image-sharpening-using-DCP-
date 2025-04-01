@@ -1,0 +1,119 @@
+#include <sycl/sycl.hpp>
+#include <fstream>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+using namespace sycl;
+using namespace std;
+struct RGB {
+    unsigned char r, g, b;
+};
+
+// Read PPM image (simplest image format)
+bool readPPM(const std::string& filename, std::vector<RGB>& pixels, int& width, int& height) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file) return false;
+
+    std::string magic;
+    int maxVal;
+    file >> magic >> width >> height >> maxVal;
+    file.ignore(256, '\n'); // Skip to end of line
+
+    if (magic != "P6" || maxVal != 255) return false;
+
+    pixels.resize(width * height);
+    file.read(reinterpret_cast<char*>(pixels.data()), width * height * 3);
+
+    return file.good();
+}
+
+// Write PPM image
+bool writePPM(const std::string& filename, const std::vector<RGB>& pixels, int width, int height) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file) return false;
+
+    file << "P6\n" << width << " " << height << "\n255\n";
+    file.write(reinterpret_cast<const char*>(pixels.data()), width * height * 3);
+
+    return file.good();
+}
+
+void sharpen_image_dpcpp(std::vector<RGB>& input, std::vector<RGB>& output, int width, int height) {
+    // Define sharpening kernel
+    const float kernel[3][3] = {
+        { 0, -1,  0},
+        {-1,  5, -1},
+        { 0, -1,  0}
+    };
+
+    queue q(gpu_selector_v);
+
+    // Create buffers
+    buffer<RGB, 1> input_buf(input.data(), range<1>(width * height));
+    buffer<RGB, 1> output_buf(output.data(), range<1>(width * height));
+
+    q.submit([&](handler& h) {
+        auto in = input_buf.get_access<access::mode::read>(h);
+        auto out = output_buf.get_access<access::mode::write>(h);
+
+        h.parallel_for(range<2>(height, width), [=](id<2> idx) {
+            int y = idx[0];
+            int x = idx[1];
+            int index = y * width + x;
+
+            float r = 0.0f, g = 0.0f, b = 0.0f;
+
+            // Apply convolution kernel
+            for (int ky = -1; ky <= 1; ky++) {
+                for (int kx = -1; kx <= 1; kx++) {
+                    int px = clamp(x + kx, 0, width - 1);
+                    int py = clamp(y + ky, 0, height - 1);
+                    int pidx = py * width + px;
+
+                    float weight = kernel[ky + 1][kx + 1];
+                    RGB pixel = in[pidx];
+
+                    r += pixel.r * weight;
+                    g += pixel.g * weight;
+                    b += pixel.b * weight;
+                }
+            }
+
+            // Clamp values and store
+            out[index] = RGB{
+                static_cast<unsigned char>(clamp(r, 0.0f, 255.0f)),
+                static_cast<unsigned char>(clamp(g, 0.0f, 255.0f)),
+                static_cast<unsigned char>(clamp(b, 0.0f, 255.0f))
+            };
+            });
+        });
+
+    q.wait();
+}
+
+int main() {
+    const string input_file = "C:\\Users\\hrbrv\\OneDrive\\Desktop\\demonstration\\saturn_ppm.ppm";
+    const string output_file  = "C:\\Users\\hrbrv\\OneDrive\\Desktop\\demonstration\\output_sharpened.ppm";
+
+    int width, height;
+    std::vector<RGB> pixels;
+
+    if (!readPPM(input_file, pixels, width, height)) {
+        std::cerr << "Error: Could not read input image" << std::endl;
+        return 1;
+    }
+
+    std::vector<RGB> output(pixels.size());
+
+    // Perform sharpening
+    sharpen_image_dpcpp(pixels, output, width, height);
+
+    if (!writePPM(output_file, output, width, height)) {
+        std::cerr << "Error: Could not write output image" << std::endl;
+        return 1;
+    }
+
+    std::cout << "Sharpening complete. Saved to " << output_file << std::endl;
+    return 0;
+}
